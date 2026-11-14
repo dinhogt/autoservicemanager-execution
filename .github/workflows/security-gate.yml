@@ -1,0 +1,41 @@
+name: Security Gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: yarn
+
+      - run: yarn install --frozen-lockfile
+
+      - name: Dependency audit
+        run: yarn audit --groups dependencies --level high
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Filesystem vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Build container image
+        run: docker build -t autoservicemanager-execution:${{ github.sha }} .

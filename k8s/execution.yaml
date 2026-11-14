@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoservice
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoservice-execution
+  namespace: autoservice
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/autoservicemanager-ENV-execution-irsa
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: execution-config
+  namespace: autoservice
+data:
+  # Substitua ACCOUNT_ID/ENV pelos outputs do Terraform (infra-db / infra-k8s).
+  # Filas/tópicos reais: ${project}-${env}-execution-commands|events
+  NODE_ENV: production
+  PORT: "3000"
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: autoservicemanager-ENV-execution
+  SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/ACCOUNT_ID/autoservicemanager-ENV-execution-commands
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:ACCOUNT_ID:autoservicemanager-ENV-execution-events
+  SQS_WAIT_TIME_SECONDS: "20"
+  SQS_VISIBILITY_TIMEOUT: "60"
+  SWAGGER_ENABLED: "false"
+  AWS_XRAY_ENABLED: "true"
+  AWS_XRAY_CONTEXT_MISSING: LOG_ERROR
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: execution
+  namespace: autoservice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: execution
+  template:
+    metadata:
+      labels:
+        app: execution
+    spec:
+      serviceAccountName: autoservice-execution
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: execution
+          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/autoservicemanager-execution:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: execution-config
+          ports:
+            - name: http
+              containerPort: 3000
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: execution
+  namespace: autoservice
+spec:
+  selector:
+    app: execution
+  ports:
+    - name: http
+      # Alinhado ao Billing (Service :80 → container :3000); NLB usa target_port 3000 (pod).
+      port: 80
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: execution
+  namespace: autoservice
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: execution
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: execution
+  namespace: autoservice
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: execution

@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [master, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security:
+    uses: ./.github/workflows/security-gate.yml
+
+  quality:
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn lint
+      - run: yarn test:cov
+      - run: yarn build
+      - name: Sonar quality gate
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v6
+
+      - name: Sonar token not configured
+        if: env.SONAR_TOKEN == ''
+        run: echo "::warning::SONAR_TOKEN is not configured; Sonar analysis was skipped."
+
+  cd:
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') &&
+      vars.ENABLE_OIDC_CD == 'true'
+    needs: [quality, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    environment: ${{ github.ref == 'refs/heads/master' && 'production' || 'homolog' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push immutable image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER_NAME }}" --region "${{ vars.AWS_REGION || 'us-east-1' }}"
+
+      - name: Deploy SHA image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IRSA_ROLE_ARN: ${{ secrets.IRSA_ROLE_ARN }}
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
+          sed \
+            -e "s|ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/autoservicemanager-execution:latest|$IMAGE|g" \
+            -e "s|arn:aws:iam::ACCOUNT_ID:role/autoservicemanager-ENV-execution-irsa|$IRSA_ROLE_ARN|g" \
+            -e "s|ACCOUNT_ID|$ACCOUNT_ID|g" \
+            k8s/execution.yaml | kubectl apply -f -
+          kubectl rollout status deployment/execution -n autoservice --timeout=180s
+
+      - name: Roll back failed rollout
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/execution -n autoservice
+          kubectl rollout status deployment/execution -n autoservice --timeout=180s
