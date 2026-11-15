@@ -6,15 +6,12 @@ on:
   pull_request:
     branches: [master, develop]
 
-permissions:
-  contents: read
-
 concurrency:
   group: execution-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  security:
+  security-gate:
     uses: ./.github/workflows/security-gate.yml
 
   quality:
@@ -47,7 +44,7 @@ jobs:
       github.event_name == 'push' &&
       (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') &&
       vars.ENABLE_OIDC_CD == 'true'
-    needs: [quality, security]
+    needs: [quality, security-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
